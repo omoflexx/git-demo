@@ -18,8 +18,9 @@ from typing import Optional
 # Configuration — replace these placeholders with your actual API keys
 # ---------------------------------------------------------------------------
 
-DVLA_API_KEY = "YOUR_DVLA_API_KEY_HERE"   # https://developer-portal.driver-vehicle-licensing.api.gov.uk/
-SERPAPI_KEY  = "YOUR_SERPAPI_KEY_HERE"    # https://serpapi.com/ (100 free searches/month)
+DVLA_API_KEY = "TestKeys"   # https://developer-portal.driver-vehicle-licensing.api.gov.uk/
+SERPAPI_KEY  = "TestKeys"    # https://serpapi.com/ (100 free searches/month)
+Keyz= "testing"
 
 # ---------------------------------------------------------------------------
 
