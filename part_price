@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+UK Vehicle Part Price Estimator
+Usage: python part_price.py <REG> "<PART NAME>"
+Example: python part_price.py AB12CDE "front brake pads"
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import argparse
+import requests
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Configuration — replace these placeholders with your actual API keys
+# ---------------------------------------------------------------------------
+
+DVLA_API_KEY = "YOUR_DVLA_API_KEY_HERE"   # https://developer-portal.driver-vehicle-licensing.api.gov.uk/
+SERPAPI_KEY  = "YOUR_SERPAPI_KEY_HERE"    # https://serpapi.com/ (100 free searches/month)
+
+# ---------------------------------------------------------------------------
+
+DVLA_URL = "https://driver-vehicle-licensing.api.gov.uk/vehicle-enquiry/v1/vehicles"
+SERPAPI_URL = "https://serpapi.com/search"
+EURO_CAR_PARTS_SEARCH = "https://www.eurocarparts.com/search"
+GSF_SEARCH = "https://www.gsfcarparts.com/search"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-GB,en;q=0.9",
+}
+
+
+# ---------------------------------------------------------------------------
+# Step 1: DVLA lookup
+# ---------------------------------------------------------------------------
+
+def lookup_vehicle(reg: str) -> dict:
+    """Return vehicle details from DVLA VES API."""
+    reg_clean = re.sub(r"\s+", "", reg).upper()
+    resp = requests.post(
+        DVLA_URL,
+        headers={
+            "x-api-key": DVLA_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={"registrationNumber": reg_clean},
+        timeout=10,
+    )
+    if resp.status_code == 200:
+        return resp.json()
+    elif resp.status_code == 404:
+        raise ValueError(f"Registration '{reg}' not found on DVLA records.")
+    else:
+        raise RuntimeError(f"DVLA API error {resp.status_code}: {resp.text}")
+
+
+def vehicle_description(info: dict) -> str:
+    """Build a human-readable vehicle description from DVLA data."""
+    make   = info.get("make", "Unknown")
+    colour = info.get("colour", "")
+    year   = info.get("yearOfManufacture", "")
+    fuel   = info.get("fuelType", "")
+    engine = info.get("engineCapacity", "")
+    parts  = [str(year), colour, make]
+    if engine:
+        parts.append(f"{int(engine)}cc")
+    if fuel:
+        parts.append(fuel.capitalize())
+    return " ".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Step 2a: Price via SerpAPI Google Shopping (preferred)
+# ---------------------------------------------------------------------------
+
+def search_serpapi(query: str) -> list[dict]:
+    """Search Google Shopping via SerpAPI and return price results."""
+    params = {
+        "engine": "google_shopping",
+        "q": query,
+        "gl": "uk",
+        "hl": "en",
+        "api_key": SERPAPI_KEY,
+        "num": 10,
+    }
+    resp = requests.get(SERPAPI_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    results = []
+    for item in data.get("shopping_results", []):
+        price_str = item.get("price", "")
+        price = parse_price_gbp(price_str)
+        if price:
+            results.append({
+                "title":  item.get("title", ""),
+                "price":  price,
+                "source": item.get("source", ""),
+                "link":   item.get("link", ""),
+            })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: Fallback — scrape Euro Car Parts
+# ---------------------------------------------------------------------------
+
+def search_euro_car_parts(query: str) -> list[dict]:
+    """Scrape Euro Car Parts search results for prices (best-effort)."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("  [info] Install beautifulsoup4 for web scraping: pip install beautifulsoup4")
+        return []
+
+    try:
+        resp = requests.get(EURO_CAR_PARTS_SEARCH, params={"q": query}, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  [warn] Euro Car Parts scrape failed: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+    for card in soup.select(".product-list-item, [data-product-id]")[:10]:
+        title_el = card.select_one(".product-title, h3, h2")
+        price_el = card.select_one(".price, .product-price, [data-price]")
+        if not price_el:
+            continue
+        title = title_el.get_text(strip=True) if title_el else "Part"
+        price = parse_price_gbp(price_el.get_text(strip=True))
+        if price:
+            results.append({
+                "title":  title,
+                "price":  price,
+                "source": "Euro Car Parts",
+                "link":   resp.url,
+            })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Step 2c: Fallback — scrape GSF Car Parts
+# ---------------------------------------------------------------------------
+
+def search_gsf(query: str) -> list[dict]:
+    """Scrape GSF Car Parts search results for prices (best-effort)."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    try:
+        resp = requests.get(GSF_SEARCH, params={"q": query}, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  [warn] GSF scrape failed: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+    for card in soup.select(".product-item, .product-card, [data-product]")[:10]:
+        title_el = card.select_one("h2, h3, .product-name")
+        price_el = card.select_one(".price, .product-price")
+        if not price_el:
+            continue
+        title = title_el.get_text(strip=True) if title_el else "Part"
+        price = parse_price_gbp(price_el.get_text(strip=True))
+        if price:
+            results.append({
+                "title":  title,
+                "price":  price,
+                "source": "GSF Car Parts",
+                "link":   resp.url,
+            })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_price_gbp(text: str) -> Optional[float]:
+    """Extract a £ price from a string, return as float or None."""
+    if not text:
+        return None
+    text = text.replace(",", "")
+    match = re.search(r"£\s*(\d+(?:\.\d{1,2})?)", text)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"(\d+\.\d{2})", text)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def summarise_prices(results: list[dict]) -> dict:
+    """Return min, max and average prices from a list of results."""
+    prices = [r["price"] for r in results if r.get("price")]
+    if not prices:
+        return {}
+    return {
+        "min":     round(min(prices), 2),
+        "max":     round(max(prices), 2),
+        "average": round(sum(prices) / len(prices), 2),
+        "count":   len(prices),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Look up an approximate UK OEM part price for a vehicle registration."
+    )
+    parser.add_argument("reg",  help="UK vehicle registration, e.g. AB12CDE")
+    parser.add_argument("part", help='Part name, e.g. "front brake pads"')
+    parser.add_argument("--json", action="store_true", help="Output raw JSON instead of formatted text")
+    args = parser.parse_args()
+
+    print(f"\n Looking up registration: {args.reg.upper()}")
+
+    # --- DVLA lookup ---
+    if DVLA_API_KEY == "YOUR_DVLA_API_KEY_HERE":
+        print("  [warn] DVLA API key not set — searching by reg plate only.")
+        vehicle_info = {}
+        vehicle_str  = args.reg.upper()
+    else:
+        try:
+            vehicle_info = lookup_vehicle(args.reg)
+            vehicle_str  = vehicle_description(vehicle_info)
+            print(f"  Vehicle identified: {vehicle_str}")
+        except (ValueError, RuntimeError) as e:
+            print(f"  DVLA lookup failed: {e}")
+            vehicle_info = {}
+            vehicle_str  = args.reg.upper()
+
+    # Build search query
+    search_query = f"{vehicle_str} {args.part} OEM original part UK"
+    print(f"\n Searching for: '{search_query}'")
+
+    results = []
+
+    # Try SerpAPI first
+    if SERPAPI_KEY != "YOUR_SERPAPI_KEY_HERE":
+        print("  Using SerpAPI Google Shopping...")
+        try:
+            results = search_serpapi(search_query)
+            print(f"  Found {len(results)} shopping results.")
+        except Exception as e:
+            print(f"  [warn] SerpAPI failed: {e}")
+
+    # Fallback to scraping
+    if not results:
+        print("  Trying Euro Car Parts...")
+        results = search_euro_car_parts(search_query)
+        time.sleep(0.5)
+
+    if not results:
+        print("  Trying GSF Car Parts...")
+        results = search_gsf(search_query)
+
+    # --- Output ---
+    output = {
+        "registration":  args.reg.upper(),
+        "part":          args.part,
+        "vehicle":       vehicle_info,
+        "search_query":  search_query,
+        "results":       results,
+        "price_summary": summarise_prices(results),
+    }
+
+    if args.json:
+        print(json.dumps(output, indent=2))
+        return
+
+    print("\n" + "=" * 60)
+    print(f"  Vehicle : {vehicle_str}")
+    print(f"  Part    : {args.part}")
+    print("=" * 60)
+
+    summary = output["price_summary"]
+    if summary:
+        print(f"\n  Price estimate (from {summary['count']} listings):")
+        print(f"     Lowest  : £{summary['min']:.2f}")
+        print(f"     Average : £{summary['average']:.2f}")
+        print(f"     Highest : £{summary['max']:.2f}")
+        print()
+        print("  Top listings:")
+        for r in sorted(results, key=lambda x: x["price"])[:5]:
+            print(f"    £{r['price']:.2f}  —  {r['title'][:60]}  [{r['source']}]")
+    else:
+        print("\n  No prices found. Tips:")
+        print("     • Fill in your SERPAPI_KEY at the top of the script.")
+        print("     • Try a more specific part name (e.g. 'front brake disc' not 'brakes').")
+        print("     • Check your DVLA_API_KEY is valid.")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
